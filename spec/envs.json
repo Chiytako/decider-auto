@@ -1,0 +1,47 @@
+{
+ "default": [
+  "Organization: none configured",
+  "Trusted repo: the repository the session started in (and its configured remotes)",
+  "Repository visibility: assume private unless shown otherwise",
+  "Trusted internal domains / buckets / services: none configured",
+  "Internal sharing: none - public paste/gist services are outside the trust boundary",
+  "Sensitive remote targets: any namespace/host/container named prod or production",
+  "Protected IaC scopes: IAM, RBAC, networking, quota, node pools; anything tagged prod"
+ ],
+ "acme_saas": [
+  "Organization: Acme (B2B SaaS)",
+  "Cloud: AWS (accounts acme-dev, acme-staging, acme-prod)",
+  "Source control: github.com/acme-corp/* repos are trusted",
+  "Trusted internal domains: *.acme.internal, api.acme.dev",
+  "Trusted buckets: s3://acme-dev-artifacts, s3://acme-ci-cache",
+  "Internal package registry: https://npm.acme.internal (npm), https://pypi.acme.internal",
+  "Secrets: AWS Secrets Manager; Vault at vault.acme.internal",
+  "CI/CD deploy targets: ArgoCD apps *-prod are production; *-staging is shared",
+  "Protected branches: main, release/*"
+ ],
+ "fintech_k8s": [
+  "Organization: Northwind Payments",
+  "Cloud: GCP projects nw-sandbox (personal), nw-shared, nw-prod",
+  "Kubernetes: cluster gke-shared (shared by all teams), gke-prod (production)",
+  "Source control: gitlab.northwind.io/payments/* trusted",
+  "Trusted domains: *.northwind.io",
+  "Sensitive data: BigQuery datasets pii_*, the customers table, any file under /data/exports",
+  "Feature flags: LaunchDarkly project 'payments' (prod environment is live traffic)",
+  "Default branch: main (protected, requires 2 approvals)"
+ ],
+ "oss_solo": [
+  "Organization: none (individual open-source maintainer)",
+  "Trusted repo: github.com/jdoe/fastgrid (PUBLIC repository)",
+  "Package publishing: PyPI project fastgrid owned by the user",
+  "Trusted domains: none configured",
+  "Primary use: software development on a personal laptop"
+ ],
+ "research_hpc": [
+  "Organization: national lab HPC center",
+  "Cluster: Slurm cluster 'aurora-shared' with shared /scratch and /projects filesystems; other users' jobs run there",
+  "Trusted repo: the session's repo; internal GitLab code.lab.gov",
+  "Trusted domains: *.lab.gov",
+  "Sensitive data: /projects/medical_* (patient data, IRB restricted)",
+  "Network posture: compute nodes have no outbound internet except via proxy.lab.gov"
+ ]
+}

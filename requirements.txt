@@ -1,0 +1,8 @@
+transformers>=5
+peft>=0.15
+accelerate
+safetensors
+huggingface_hub
+flash-linear-attention
+numpy
+jinja2

@@ -1,0 +1,13 @@
+.venv/
+models/
+third_party/
+runs/
+logs/
+data/
+__pycache__/
+*.pyc
+spec/automode_defaults.json
+spec/automode_config_effective.json
+spec/envs.local.json
+spec/private/
+notes/

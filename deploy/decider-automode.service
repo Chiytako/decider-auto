@@ -1,0 +1,26 @@
+# Template unit for the auto-mode judge service (stage 1 on one GPU, stage 2 via an LLM).
+# Install:
+#   sudo cp deploy/decider-automode.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now decider-automode
+# Adjust User, LLM_URL, LLM_MODEL and JUDGE_ENV first. %h is the service user's home directory.
+# Swap models by repointing models/automode-current, then `sudo systemctl restart decider-automode`.
+# Stage 1 uses about 9 GB of GPU memory at 4k-token contexts; keep MemoryMax above the process peak.
+[Unit]
+Description=decider-auto judge for auto mode (stage 1 + stage 2 on 127.0.0.1:8095)
+After=network-online.target
+
+[Service]
+User=sit
+WorkingDirectory=%h/decider-auto
+Environment=PYTHONUNBUFFERED=1
+Environment=LLM_URL=http://127.0.0.1:8000/v1/chat/completions
+Environment=LLM_MODEL=your-stage-2-model
+Environment=JUDGE_ENV=default
+ExecStart=%h/decider-auto/.venv/bin/python -m automode.server --model %h/decider-auto/models/automode-current --host 127.0.0.1 --port 8095 --block 0.5 --env $JUDGE_ENV --llm_url $LLM_URL --llm_model $LLM_MODEL
+MemoryHigh=16G
+MemoryMax=20G
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

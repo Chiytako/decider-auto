@@ -1,0 +1,14 @@
+decider-auto
+Copyright 2026 the decider-auto contributors
+
+This product includes software developed as part of Mapika/decider
+(https://github.com/Mapika/decider), Copyright 2026 Mark Marosi, licensed under
+the Apache License, Version 2.0. The code in `automode/`, `scripts/`, `tools/` and
+`hooks/` is original to this project; the model weights on Hugging Face
+(ChiTako/decider-4b-automode) are a fine-tune of Mapika/decider-4b, which is in
+turn a fine-tune of Qwen/Qwen3.5-4B-Base (Apache-2.0).
+
+Changes from Mapika/decider: a state view for coding-agent transcripts, the
+auto-mode question set and rule taxonomy, a LoRA fine-tuning script with KL replay,
+a two-stage judge service, a data pipeline for contrastive scenarios and recorded
+agent decisions, a Claude Code hook and a systemd unit template.
