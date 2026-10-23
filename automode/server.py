@@ -9,7 +9,9 @@ POST /judge  {"session_id", "tool_name", "tool_input", "tool_use_id"?, "transcri
   -> {"decision": "allow"|"block"|"ask"|"skip", "source": "stage1"|"stage2"|"stage1_fallback", "p_block", "group", "rule",
       "reason", "stage2": {...}?, "ms", ...}
   stage 1 p_block < --pass (--pass_custom when the user changed allow / soft_deny, which stage 1 never learned) -> allow;
-  otherwise stage 2 decides allow / block. If stage 2 fails: block when p_block >= --block, else ask.
+  --pass_web raises the threshold for WebFetch/WebSearch/web_url_read (their benign base rate is high; stage 2 still
+  sees anything that really looks suspicious). Otherwise stage 2 decides allow / block; --llm_effort_fast (e.g. "none")
+  lowers the stage-2 reasoning budget for those read-only web tools. If stage 2 fails: block when p_block >= --block, else ask.
   "skip" means the tool never reaches the classifier (read-only tools, edits inside the working directory).
 GET /policy?env=<id> -> the default rules (environment, allow, soft_deny, hard_deny) for settings screens
 GET /health -> {"ok": true, "model": ..., "stats": {...}}
@@ -31,6 +33,24 @@ from automode import transcript as TR
 from automode.infer import AutoModeJudge
 
 FILE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
+WEB_TOOLS = {"WebFetch", "WebSearch", "mcp__search__searxng_web_search", "mcp__search__web_url_read"}
+
+
+def pass_threshold(args, tool, customized):
+    """stage-1 pass threshold. Web tools (read-only fetches/searches) have a high benign base rate, so --pass_web lets
+    them skip stage 2 unless stage 1 is really suspicious; it is ignored when the user changed allow/soft_deny rules,
+    because stage 1 never learned those."""
+    if getattr(args, "pass_web", 0) and tool in WEB_TOOLS and not (customized["allow"] or customized["soft_deny"]):
+        return args.pass_web
+    return args.pass_custom if (customized["allow"] or customized["soft_deny"]) else args.pass_
+
+
+def stage2_effort(args, tool):
+    """--llm_effort_fast (e.g. "none") for read-only web tools: their policy decisions are simple and stage 2 at low
+    effort spends 200-700 reasoning tokens, which is most of the 2.3 s latency."""
+    if getattr(args, "llm_effort_fast", "") and tool in WEB_TOOLS:
+        return args.llm_effort_fast
+    return args.llm_effort
 
 
 def skip_reason(tool, inp, cwd):
@@ -90,14 +110,15 @@ class Service:
         a = self.args
         p = out["p_block"]
         custom = POL.customized(rules, env_id)
-        threshold = a.pass_custom if (custom["allow"] or custom["soft_deny"]) else a.pass_
+        threshold = pass_threshold(a, action.get("tool"), custom)
         if not a.llm_url:                       # stage 1 only: its own block / ask thresholds
             return dict(out, source="stage1")
         if p < threshold:
             return dict(out, decision="allow", source="stage1")
         hint = {"p_block": p, "rule": out.get("rule"), "group": out.get("top_group")}
         try:
-            r2 = S2.review(a.llm_url, a.llm_model, policy, state, action, hint, effort=a.llm_effort, timeout=a.llm_timeout)
+            r2 = S2.review(a.llm_url, a.llm_model, policy, state, action, hint, effort=stage2_effort(a, action.get("tool")),
+                           timeout=a.llm_timeout)
         except Exception as e:  # noqa: BLE001  stage 2 unavailable: fall back on stage 1
             dec = "block" if p >= a.block else "ask"
             return dict(out, decision=dec, source="stage1_fallback", stage2={"error": f"{type(e).__name__}: {e}"[:300]})
@@ -150,9 +171,11 @@ def main():
     ap.add_argument("--env", default="default", help="environment id from spec/envs.json / envs.local.json used when a request has none")
     ap.add_argument("--pass", dest="pass_", type=float, default=0.02, help="stage-1 p_block below this is allowed without stage 2")
     ap.add_argument("--pass_custom", type=float, default=0.002, help="the same when the user changed allow / soft_deny rules")
+    ap.add_argument("--pass_web", type=float, default=0.0, help="the same for WebFetch/WebSearch/web_url_read (0: use --pass)")
     ap.add_argument("--llm_url", default="", help="OpenAI-compatible chat completions URL for stage 2 (empty: stage 1 only)")
     ap.add_argument("--llm_model", default="deepseek-ai/DeepSeek-V4.1-Flash")
     ap.add_argument("--llm_effort", default="low", help="reasoning_effort sent to the stage-2 LLM ('' to omit)")
+    ap.add_argument("--llm_effort_fast", default="", help="the same for web tools (e.g. 'none'; '' to use --llm_effort)")
     ap.add_argument("--llm_timeout", type=float, default=60.0)
     ap.add_argument("--max_sessions", type=int, default=16)
     ap.add_argument("--log", default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),

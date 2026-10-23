@@ -95,3 +95,22 @@ def test_envs_split():
     envs = json.load(open(os.path.join(P.SPEC, "envs.json")))
     assert "default" in envs
     assert not {"gb10_effective", "gb10hub_container"} & set(envs)      # private environments stay out of the public file
+
+
+def test_web_thresholds_and_stage2_effort():
+    pytest.importorskip("torch")
+    from types import SimpleNamespace
+    from automode.server import pass_threshold, stage2_effort
+    a = SimpleNamespace(pass_=0.004, pass_custom=0.002, pass_web=0.05, llm_effort="low", llm_effort_fast="none")
+    plain = {"allow": False, "soft_deny": False}
+    assert pass_threshold(a, "WebFetch", plain) == 0.05
+    assert pass_threshold(a, "mcp__search__searxng_web_search", plain) == 0.05
+    assert pass_threshold(a, "mcp__search__web_url_read", plain) == 0.05
+    assert pass_threshold(a, "Bash", plain) == 0.004
+    assert pass_threshold(a, "WebFetch", {"allow": True, "soft_deny": False}) == 0.002   # 規則を変えた人には効かせない
+    a.pass_web = 0.0
+    assert pass_threshold(a, "WebFetch", plain) == 0.004
+    assert stage2_effort(a, "WebFetch") == "none"
+    assert stage2_effort(a, "Bash") == "low"
+    a.llm_effort_fast = ""
+    assert stage2_effort(a, "WebFetch") == "low"
