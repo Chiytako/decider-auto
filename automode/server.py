@@ -11,7 +11,8 @@ POST /judge  {"session_id", "tool_name", "tool_input", "tool_use_id"?, "transcri
   stage 1 p_block < --pass (--pass_custom when the user changed allow / soft_deny, which stage 1 never learned) -> allow;
   --pass_web raises the threshold for WebFetch/WebSearch/web_url_read (their benign base rate is high; stage 2 still
   sees anything that really looks suspicious). Otherwise stage 2 decides allow / block; --llm_effort_fast (e.g. "none")
-  lowers the stage-2 reasoning budget for those read-only web tools. If stage 2 fails: block when p_block >= --block, else ask.
+  lowers the stage-2 reasoning budget for those read-only web tools. If stage 2 fails, one fast retry (reasoning off,
+  --llm_retry_timeout) is tried; if that fails too: block when p_block >= --block, else ask.
   "skip" means the tool never reaches the classifier (read-only tools, edits inside the working directory).
 GET /policy?env=<id> -> the default rules (environment, allow, soft_deny, hard_deny) for settings screens
 GET /health -> {"ok": true, "model": ..., "stats": {...}}
@@ -51,6 +52,27 @@ def stage2_effort(args, tool):
     if getattr(args, "llm_effort_fast", "") and tool in WEB_TOOLS:
         return args.llm_effort_fast
     return args.llm_effort
+
+
+def stage2_with_retry(args, policy, state, action, hint):
+    """Stage 2 with one fast retry. The stage-2 LLM is a shared workstation model: under other users' load it can
+    exceed the timeout, and a reasoning reply can come back empty (finish_reason=length). Retrying once with
+    reasoning off ("none", a few hundred tokens) recovers both, well inside the Hub's 90 s wait. The first
+    attempt's errors are kept in the returned record."""
+    first = stage2_effort(args, action.get("tool"))
+    attempts = [(first, getattr(args, "llm_timeout", 45.0), S2.MAX_TOKENS),
+                ("none" if first != "none" else first, getattr(args, "llm_retry_timeout", 15.0), 4000)]
+    errors = []
+    for effort, timeout, max_tokens in attempts:
+        try:
+            r2 = S2.review(args.llm_url, args.llm_model, policy, state, action, hint, effort=effort,
+                           timeout=timeout, max_tokens=max_tokens)
+            if errors:
+                r2["retry"] = {"errors": errors, "effort": effort}
+            return r2
+        except Exception as e:  # noqa: BLE001  try the next attempt; the caller falls back to stage 1
+            errors.append(f"{type(e).__name__}: {e}"[:200])
+    raise RuntimeError("; ".join(errors))
 
 
 def skip_reason(tool, inp, cwd):
@@ -117,8 +139,7 @@ class Service:
             return dict(out, decision="allow", source="stage1")
         hint = {"p_block": p, "rule": out.get("rule"), "group": out.get("top_group")}
         try:
-            r2 = S2.review(a.llm_url, a.llm_model, policy, state, action, hint, effort=stage2_effort(a, action.get("tool")),
-                           timeout=a.llm_timeout)
+            r2 = stage2_with_retry(a, policy, state, action, hint)
         except Exception as e:  # noqa: BLE001  stage 2 unavailable: fall back on stage 1
             dec = "block" if p >= a.block else "ask"
             return dict(out, decision=dec, source="stage1_fallback", stage2={"error": f"{type(e).__name__}: {e}"[:300]})
@@ -176,7 +197,8 @@ def main():
     ap.add_argument("--llm_model", default="deepseek-ai/DeepSeek-V4.1-Flash")
     ap.add_argument("--llm_effort", default="low", help="reasoning_effort sent to the stage-2 LLM ('' to omit)")
     ap.add_argument("--llm_effort_fast", default="", help="the same for web tools (e.g. 'none'; '' to use --llm_effort)")
-    ap.add_argument("--llm_timeout", type=float, default=60.0)
+    ap.add_argument("--llm_timeout", type=float, default=45.0, help="seconds for the first stage-2 attempt")
+    ap.add_argument("--llm_retry_timeout", type=float, default=15.0, help="seconds for the one fast retry (reasoning off)")
     ap.add_argument("--max_sessions", type=int, default=16)
     ap.add_argument("--log", default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                                   "logs", "automode_server.jsonl"))

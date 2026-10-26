@@ -54,22 +54,52 @@ def case_text(state: dict, action: dict, hint: dict | None = None) -> str:
     return text
 
 
+MAX_TOKENS = 24000   # reasoning ("low") and the JSON share this budget; 8000 sometimes ran out and left content empty
+
+
+def decision_from_text(txt: str) -> dict | None:
+    """The last JSON object in txt that carries a decision. Reasoning models may restate the answer in
+    reasoning_content, and a reply may wrap the JSON in fences or prose, so scan for objects instead of
+    slicing between the first "{" and the last "}"."""
+    dec = json.JSONDecoder()
+    best = None
+    i = 0
+    while True:
+        j = txt.find("{", i)
+        if j < 0:
+            return best
+        try:
+            obj, end = dec.raw_decode(txt, j)
+        except json.JSONDecodeError:
+            i = j + 1
+            continue
+        if isinstance(obj, dict) and obj.get("decision") in ("allow", "block"):
+            best = obj
+        i = end
+
+
 def review(url: str, model: str, policy: dict, state: dict, action: dict, hint: dict | None = None,
-           effort: str = "low", timeout: float = 60.0) -> dict:
+           effort: str = "low", timeout: float = 60.0, max_tokens: int = MAX_TOKENS) -> dict:
     """-> {"decision": allow|block, "rule", "reason", "ms"}; raises on transport or parse failure."""
     t0 = time.perf_counter()
-    body = {"model": model, "temperature": 0, "max_tokens": 8000, "response_format": {"type": "json_object"},
+    body = {"model": model, "temperature": 0, "max_tokens": max_tokens, "response_format": {"type": "json_object"},
             "messages": [{"role": "system", "content": system_prompt(policy)}, {"role": "user", "content": case_text(state, action, hint)}]}
     if effort:
         body["reasoning_effort"] = effort
     req = urllib.request.Request(url, json.dumps(body, ensure_ascii=False).encode(), {"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         d = json.load(r)
-    txt = (d["choices"][0]["message"].get("content") or "").strip()
-    txt = re.sub(r"^```(?:json)?\s*|\s*```$", "", txt)
-    out = json.loads(txt[txt.find("{"): txt.rfind("}") + 1])
+    choice = (d.get("choices") or [{}])[0]
+    msg = choice.get("message") or {}
+    out = None
+    for key in ("content", "reasoning_content"):  # reasoning_content only as a last resort (see docstring)
+        txt = re.sub(r"^```(?:json)?\s*|\s*```$", "", (msg.get(key) or "").strip())
+        out = decision_from_text(txt) if txt else None
+        if out:
+            break
+    if out is None:
+        raise ValueError(f"no JSON decision in stage-2 reply (finish_reason={choice.get('finish_reason')!r}, "
+                         f"content={len(msg.get('content') or '')} chars)")
     dec = out.get("decision")
-    if dec not in ("allow", "block"):
-        raise ValueError(f"bad stage-2 decision {dec!r}")
     return {"decision": dec, "rule": out.get("rule") if dec == "block" else None, "reason": str(out.get("reason") or "")[:500],
             "ms": (time.perf_counter() - t0) * 1000}

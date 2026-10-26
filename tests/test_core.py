@@ -79,6 +79,79 @@ def test_stage2_prompt_and_case():
     assert "proposed_action" in S2.case_text({"user_messages": []}, {"tool": "Read", "input": {}})
 
 
+def test_stage2_reply_parsing(monkeypatch):
+    """A reasoning model may wrap the JSON in fences/prose, or leave content empty and put everything in
+    reasoning_content (finish_reason=length). Both used to end as "判定できませんでした"."""
+    seen = {}
+
+    def fake_urlopen(req, timeout=None):
+        seen["body"] = json.loads(req.data)
+        seen["timeout"] = timeout
+        payload = seen["reply"]
+
+        class R:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return json.dumps(payload).encode()
+        return R()
+
+    monkeypatch.setattr(S2.urllib.request, "urlopen", fake_urlopen)
+    pol = {"environment": [], "hard_deny": [], "soft_deny": [], "allow": []}
+    state, action = {"user_messages": []}, {"tool": "Bash", "input": {"command": "x"}}
+
+    seen["reply"] = {"choices": [{"message": {"content": "Sure.\n```json\n{\"decision\": \"block\", \"rule\": \"R\", \"reason\": \"why\"}\n```"},
+                                 "finish_reason": "stop"}]}
+    r = S2.review("http://x", "m", pol, state, action)
+    assert r["decision"] == "block" and r["rule"] == "R"
+    assert seen["body"]["max_tokens"] == S2.MAX_TOKENS and seen["body"]["max_tokens"] >= 16000
+
+    seen["reply"] = {"choices": [{"message": {"content": "", "reasoning_content": "maybe {noise} then {\"decision\": \"allow\"}"},
+                                 "finish_reason": "length"}]}
+    r = S2.review("http://x", "m", pol, state, action)
+    assert r["decision"] == "allow" and r["rule"] is None
+
+    seen["reply"] = {"choices": [{"message": {"content": ""}, "finish_reason": "length"}]}
+    with pytest.raises(ValueError, match="length"):
+        S2.review("http://x", "m", pol, state, action)
+
+
+def test_stage2_retry(monkeypatch):
+    """A timeout or empty reply gets one fast retry (reasoning off) before falling back to stage 1."""
+    pytest.importorskip("torch")
+    from types import SimpleNamespace
+    from automode.server import stage2_with_retry
+    a = SimpleNamespace(llm_url="http://x", llm_model="m", llm_effort="low", llm_effort_fast="none",
+                        llm_timeout=45.0, llm_retry_timeout=15.0)
+    calls = []
+
+    def fake(url, model, policy, state, action, hint=None, effort="low", timeout=60.0, max_tokens=0):
+        calls.append((effort, timeout, max_tokens))
+        if len(calls) == 1:
+            raise TimeoutError("timed out")
+        return {"decision": "allow", "rule": None, "reason": "", "ms": 1.0}
+
+    monkeypatch.setattr(S2, "review", fake)
+    r = stage2_with_retry(a, {}, {}, {"tool": "Bash", "input": {}}, {})
+    assert [c[0] for c in calls] == ["low", "none"] and calls[1][1] == 15.0
+    assert r["decision"] == "allow" and "timed out" in r["retry"]["errors"][0]
+
+    calls.clear()
+
+    def always_fail(*args, **kw):
+        calls.append((kw["effort"], kw["timeout"], kw["max_tokens"]))
+        raise ValueError("empty reply")
+
+    monkeypatch.setattr(S2, "review", always_fail)
+    with pytest.raises(RuntimeError) as e:
+        stage2_with_retry(a, {}, {}, {"tool": "WebFetch", "input": {}}, {})   # first effort is already "none"
+    assert len(calls) == 2 and calls[0][0] == "none" and "empty reply" in str(e.value)
+
+
 def test_skip_reason():
     pytest.importorskip("torch")
     from automode.server import skip_reason
