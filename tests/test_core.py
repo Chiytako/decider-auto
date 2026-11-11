@@ -187,3 +187,33 @@ def test_web_thresholds_and_stage2_effort():
     assert stage2_effort(a, "Bash") == "low"
     a.llm_effort_fast = ""
     assert stage2_effort(a, "WebFetch") == "low"
+
+
+def test_stage2_cooldown_and_stage1_only(monkeypatch):
+    """A failed stage 2 is skipped for --llm_cooldown seconds; stage1_only never calls it."""
+    from types import SimpleNamespace
+    from automode import server as SV
+    a = SimpleNamespace(llm_url="http://x", llm_model="m", pass_=0.004, pass_custom=0.002, pass_web=0.0, block=0.5, llm_cooldown=60.0)
+    svc = SimpleNamespace(args=a, s2_down_until=0.0)
+    calls = []
+
+    def boom(*_a, **_k):
+        calls.append(1)
+        raise RuntimeError("timed out")
+
+    monkeypatch.setattr(SV, "stage2_with_retry", boom)
+    monkeypatch.setattr(SV.POL, "customized", lambda rules, env: {"allow": False, "soft_deny": False, "environment": False})
+    act = {"tool": "Bash", "input": {}}
+    r = SV.Service.decide(svc, {"p_block": 0.05, "decision": "allow"}, {}, None, "e", {}, act)
+    assert (r["decision"], r["source"], len(calls)) == ("ask", "stage1_fallback", 1)
+    r = SV.Service.decide(svc, {"p_block": 0.7, "decision": "block"}, {}, None, "e", {}, act)   # cooling down: not called again
+    assert (r["decision"], r["source"], len(calls)) == ("block", "stage1_fallback", 1)
+    assert "skipped" in r["stage2"]["error"]
+    r = SV.Service.decide(svc, {"p_block": 0.001, "decision": "allow"}, {}, None, "e", {}, act)  # stage 1 still passes
+    assert (r["decision"], r["source"]) == ("allow", "stage1")
+    svc.s2_down_until = 0.0
+    r = SV.Service.decide(svc, {"p_block": 0.05, "decision": "allow"}, {}, None, "e", {}, act, stage1_only=True)
+    assert (r["decision"], r["source"], len(calls)) == ("ask", "stage1_fallback", 1)
+    monkeypatch.setattr(SV, "stage2_with_retry", lambda *_a, **_k: {"decision": "allow", "rule": None, "reason": "fine"})
+    r = SV.Service.decide(svc, {"p_block": 0.05, "decision": "allow"}, {}, None, "e", {}, act)
+    assert (r["decision"], r["source"]) == ("allow", "stage2")
