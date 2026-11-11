@@ -9,7 +9,14 @@ POST /judge  {"session_id", "tool_name", "tool_input", "tool_use_id"?, "transcri
   -> {"decision": "allow"|"block"|"ask"|"skip", "source": "stage1"|"stage2"|"stage1_fallback", "p_block", "group", "rule",
       "reason", "stage2": {...}?, "ms", ...}
   stage 1 p_block < --pass (--pass_custom when the user changed allow / soft_deny, which stage 1 never learned) -> allow;
-  otherwise stage 2 decides allow / block. If stage 2 fails: block when p_block >= --block, else ask.
+  --pass_web raises the threshold for WebFetch/WebSearch/web_url_read (their benign base rate is high; stage 2 still
+  sees anything that really looks suspicious). Otherwise stage 2 decides allow / block; --llm_effort_fast (e.g. "none")
+  lowers the stage-2 reasoning budget for those read-only web tools. If stage 2 fails, one fast retry (reasoning off,
+  --llm_retry_timeout) is tried; if that fails too: block when p_block >= --block, else ask (source stage1_fallback),
+  and stage 2 is skipped for --llm_cooldown seconds so that the following actions do not each wait for the timeouts.
+  Keep --llm_timeout + --llm_retry_timeout below the caller's own timeout (GB10 Hub: 90 s), or the caller gives up
+  before this fallback can answer. A request with "stage1_only": true never calls stage 2 (the caller's retry after
+  its own timeout).
   "skip" means the tool never reaches the classifier (read-only tools, edits inside the working directory).
 GET /policy?env=<id> -> the default rules (environment, allow, soft_deny, hard_deny) for settings screens
 GET /health -> {"ok": true, "model": ..., "stats": {...}}
@@ -31,6 +38,45 @@ from automode import transcript as TR
 from automode.infer import AutoModeJudge
 
 FILE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
+WEB_TOOLS = {"WebFetch", "WebSearch", "mcp__search__searxng_web_search", "mcp__search__web_url_read"}
+
+
+def pass_threshold(args, tool, customized):
+    """stage-1 pass threshold. Web tools (read-only fetches/searches) have a high benign base rate, so --pass_web lets
+    them skip stage 2 unless stage 1 is really suspicious; it is ignored when the user changed allow/soft_deny rules,
+    because stage 1 never learned those."""
+    if getattr(args, "pass_web", 0) and tool in WEB_TOOLS and not (customized["allow"] or customized["soft_deny"]):
+        return args.pass_web
+    return args.pass_custom if (customized["allow"] or customized["soft_deny"]) else args.pass_
+
+
+def stage2_effort(args, tool):
+    """--llm_effort_fast (e.g. "none") for read-only web tools: their policy decisions are simple and stage 2 at low
+    effort spends 200-700 reasoning tokens, which is most of the 2.3 s latency."""
+    if getattr(args, "llm_effort_fast", "") and tool in WEB_TOOLS:
+        return args.llm_effort_fast
+    return args.llm_effort
+
+
+def stage2_with_retry(args, policy, state, action, hint):
+    """Stage 2 with one fast retry. The stage-2 LLM is a shared workstation model: under other users' load it can
+    exceed the timeout, and a reasoning reply can come back empty (finish_reason=length). Retrying once with
+    reasoning off ("none", a few hundred tokens) recovers both, well inside the Hub's 90 s wait. The first
+    attempt's errors are kept in the returned record."""
+    first = stage2_effort(args, action.get("tool"))
+    attempts = [(first, getattr(args, "llm_timeout", 45.0), S2.MAX_TOKENS),
+                ("none" if first != "none" else first, getattr(args, "llm_retry_timeout", 15.0), 4000)]
+    errors = []
+    for effort, timeout, max_tokens in attempts:
+        try:
+            r2 = S2.review(args.llm_url, args.llm_model, policy, state, action, hint, effort=effort,
+                           timeout=timeout, max_tokens=max_tokens)
+            if errors:
+                r2["retry"] = {"errors": errors, "effort": effort}
+            return r2
+        except Exception as e:  # noqa: BLE001  try the next attempt; the caller falls back to stage 1
+            errors.append(f"{type(e).__name__}: {e}"[:200])
+    raise RuntimeError("; ".join(errors))
 
 
 def skip_reason(tool, inp, cwd):
@@ -56,6 +102,7 @@ class Service:
         self.log = open(args.log, "a") if args.log else None
         self.log_lock = threading.Lock()
         self.model = args.model
+        self.s2_down_until = 0.0                # monotonic time until which stage 2 is skipped after a failure
 
     def handle(self, req):
         tool, inp = req.get("tool_name"), req.get("tool_input") or {}
@@ -78,7 +125,7 @@ class Service:
             with self.lock:
                 out = self.judge.judge(state, {"tool": tool, "input": inp}, session_id=sid)
             out["stage1_decision"] = out["decision"]
-            out = self.decide(out, policy, rules, env_id, state, {"tool": tool, "input": inp})
+            out = self.decide(out, policy, rules, env_id, state, {"tool": tool, "input": inp}, stage1_only=req.get("stage1_only") is True)
         out["ms"] = (time.perf_counter() - t0) * 1000
         if self.log:
             rec = {"t": time.time(), "session_id": sid, "tool": tool, "input": inp, "cwd": cwd, "custom_rules": bool(rules), **out}
@@ -86,21 +133,28 @@ class Service:
                 self.log.write(json.dumps(rec, ensure_ascii=False) + "\n"); self.log.flush()
         return out
 
-    def decide(self, out, policy, rules, env_id, state, action):
+    def decide(self, out, policy, rules, env_id, state, action, stage1_only=False):
         a = self.args
         p = out["p_block"]
         custom = POL.customized(rules, env_id)
-        threshold = a.pass_custom if (custom["allow"] or custom["soft_deny"]) else a.pass_
+        threshold = pass_threshold(a, action.get("tool"), custom)
         if not a.llm_url:                       # stage 1 only: its own block / ask thresholds
             return dict(out, source="stage1")
         if p < threshold:
             return dict(out, decision="allow", source="stage1")
+        fallback = "block" if p >= a.block else "ask"
+        if stage1_only:                         # the caller already gave up on stage 2 (the Hub's timeout)
+            return dict(out, decision=fallback, source="stage1_fallback", stage2={"error": "skipped: stage1_only"})
+        down = getattr(self, "s2_down_until", 0.0) - time.monotonic()
+        if down > 0:                            # stage 2 just failed: do not make every action wait for its timeouts
+            return dict(out, decision=fallback, source="stage1_fallback",
+                        stage2={"error": f"skipped: stage 2 failed {a.llm_cooldown - down:.0f} s ago"})
         hint = {"p_block": p, "rule": out.get("rule"), "group": out.get("top_group")}
         try:
-            r2 = S2.review(a.llm_url, a.llm_model, policy, state, action, hint, effort=a.llm_effort, timeout=a.llm_timeout)
+            r2 = stage2_with_retry(a, policy, state, action, hint)
         except Exception as e:  # noqa: BLE001  stage 2 unavailable: fall back on stage 1
-            dec = "block" if p >= a.block else "ask"
-            return dict(out, decision=dec, source="stage1_fallback", stage2={"error": f"{type(e).__name__}: {e}"[:300]})
+            self.s2_down_until = time.monotonic() + getattr(a, "llm_cooldown", 0.0)
+            return dict(out, decision=fallback, source="stage1_fallback", stage2={"error": f"{type(e).__name__}: {e}"[:300]})
         return dict(out, decision=r2["decision"], source="stage2", rule=r2["rule"] if r2["decision"] == "block" else None,
                     group=out.get("top_group") if r2["decision"] == "block" else None, reason=r2["reason"], stage2=r2)
 
@@ -150,10 +204,15 @@ def main():
     ap.add_argument("--env", default="default", help="environment id from spec/envs.json / envs.local.json used when a request has none")
     ap.add_argument("--pass", dest="pass_", type=float, default=0.02, help="stage-1 p_block below this is allowed without stage 2")
     ap.add_argument("--pass_custom", type=float, default=0.002, help="the same when the user changed allow / soft_deny rules")
+    ap.add_argument("--pass_web", type=float, default=0.0, help="the same for WebFetch/WebSearch/web_url_read (0: use --pass)")
     ap.add_argument("--llm_url", default="", help="OpenAI-compatible chat completions URL for stage 2 (empty: stage 1 only)")
     ap.add_argument("--llm_model", default="deepseek-ai/DeepSeek-V4.1-Flash")
     ap.add_argument("--llm_effort", default="low", help="reasoning_effort sent to the stage-2 LLM ('' to omit)")
-    ap.add_argument("--llm_timeout", type=float, default=60.0)
+    ap.add_argument("--llm_effort_fast", default="", help="the same for web tools (e.g. 'none'; '' to use --llm_effort)")
+    ap.add_argument("--llm_timeout", type=float, default=45.0, help="seconds for the first stage-2 attempt")
+    ap.add_argument("--llm_retry_timeout", type=float, default=15.0, help="seconds for the one fast retry (reasoning off)")
+    ap.add_argument("--llm_cooldown", type=float, default=60.0,
+                    help="after stage 2 failed (both attempts), skip it for this many seconds and answer from stage 1 at once")
     ap.add_argument("--max_sessions", type=int, default=16)
     ap.add_argument("--log", default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                                   "logs", "automode_server.jsonl"))
